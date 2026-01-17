@@ -4,7 +4,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 
 import transformers.models.gpt2.modeling_gpt2 as gpt2_modeling
-from ttl_gpt2 import GPT2BlockTTL
+from ttl_gpt2 import GPT2BlockTTL, GPT2AttentionTTL
 from ttl_pytorch_utils import Conv1DTTL
 
 
@@ -32,6 +32,7 @@ with torch.no_grad():
 # overriding functionalities
 gpt2_modeling.Conv1D = Conv1DTTL
 gpt2_modeling.GPT2Block = GPT2BlockTTL
+# gpt2_modeling.GPT2Attention = GPT2AttentionTTL
 
 
 config.run_ttl = True  # Use attribute assignment, not config["run_ttl"]

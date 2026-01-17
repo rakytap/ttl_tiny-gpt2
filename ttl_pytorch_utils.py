@@ -2,11 +2,12 @@ from transformers.pytorch_utils import Conv1D
 from gstruct import GroqMLIR, TiledMemref, GroqBuffer, dtypes
 from gstruct.constants import VECTOR_SIZE, conv_np_dtype_to_dtypes
 
-from gstruct.ops import linear as ttl_linear
+from gstruct.ops import addmm as ttl_addmm
 from compile_ttl import compile_ttl_model
 from gstruct.runner import GroqRunner
+from gstruct import gstruct
 
-from typing import Union
+from typing import Union, Optional
 import numpy as np
 
 import torch
@@ -40,20 +41,30 @@ class Conv1DTTL(Conv1D):
                 program_name=compiled_program["program_name"],
             )
 
-            results_groq = runner.invoke({input_tensor_name: x.numpy()})
-            print(results_groq)
+            weight_transposed = (
+                self.weight.numpy().swapaxes(-1, -2).copy().astype(np.float16)
+            )
+            results_groq = runner.invoke(
+                {
+                    input_tensor_name: x.numpy(),
+                    "weight": weight_transposed,
+                    "bias": self.bias.numpy(),
+                }
+            )
 
         ret = results_groq[output_tensor_name]
         return torch.from_numpy(ret)
 
-        ret = super().forward(x)
-
-        print(ret)
-        ff
-
         return super().forward(x)
 
-    def forward_ttl(self, x: Union[torch.Tensor, GroqMLIR], input_tensor_name: str):
+    def forward_ttl(
+        self, x: Union[torch.Tensor, GroqMLIR], input_tensor_name: str = "image"
+    ):
+
+        # size_out = x.size()[:-1] + (self.nf,)
+        # x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+        # x = x.view(size_out)
+        # return x
 
         if isinstance(x, torch.Tensor):
             x = x.numpy()
@@ -68,10 +79,49 @@ class Conv1DTTL(Conv1D):
         else:
             x_buffer = x
 
-        x = ttl_linear(
+        x_buffer_shape = x_buffer.out_tensor_shape
+
+        x_buffer = gstruct.reshape(
             x_buffer,
-            self.weight.numpy().astype(np.float16),
-            self.bias.numpy(),
+            x_buffer.out_tmemrefs[0].merge_axes(0, len(x_buffer_shape) - 1),
+        )
+
+        weight_transposed = (
+            self.weight.numpy().swapaxes(-1, -2).copy().astype(np.float16)
+        )
+        split_num = get_split_num(weight_transposed.shape)
+
+        tweight = TiledMemref(
+            weight_transposed.shape,
+            conv_np_dtype_to_dtypes(weight_transposed.dtype),
+            ends=(split_num * VECTOR_SIZE - weight_transposed.shape[-1],),
+        )
+        weight_buffer = GroqBuffer.input("weight", tweight)
+
+        bias = self.bias.numpy()
+        split_num = get_split_num(bias.shape)
+        tbias = TiledMemref(
+            bias.shape,
+            conv_np_dtype_to_dtypes(bias.dtype),
+            ends=(split_num * VECTOR_SIZE - bias.shape[-1],),
+        )
+        bias_buffer = GroqBuffer.input("bias", tbias)
+
+        x = ttl_addmm(
+            bias_buffer,
+            x_buffer,
+            weight_buffer,
+        )
+
+        x = gstruct.reshape(
+            x,
+            TiledMemref(
+                tuple([*x_buffer_shape[0:-1], self.nf]),
+                x.out_dtype,
+                ends=(
+                    (self.nf + VECTOR_SIZE - 1) // VECTOR_SIZE * VECTOR_SIZE - self.nf,
+                ),
+            ),
         )
 
         return x
