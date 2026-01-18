@@ -43,8 +43,10 @@ def compile_ttl_model(
                 for idx in range(len(model))
             ]
 
-        else:
+        elif isinstance(model, GroqMLIR):
             output_buffer = [GroqBuffer.output(output_tensor_name, model)]
+        else:
+            raise ValueError(f"Invalid model type: {type(model)}")
 
         mlirtext = gstruct_to_mlir(output_buffer)
 

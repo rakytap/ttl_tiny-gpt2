@@ -32,7 +32,7 @@ with torch.no_grad():
 # overriding functionalities
 gpt2_modeling.Conv1D = Conv1DTTL
 gpt2_modeling.GPT2Block = GPT2BlockTTL
-# gpt2_modeling.GPT2Attention = GPT2AttentionTTL
+gpt2_modeling.GPT2Attention = GPT2AttentionTTL
 
 
 config.run_ttl = True  # Use attribute assignment, not config["run_ttl"]
