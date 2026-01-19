@@ -14,14 +14,20 @@ from transformers.masking_utils import (
 from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
 
 import numpy as np
-from typing import Optional, Callable, cast
+from typing import Optional, Callable, cast, Tuple
 import torch
 
-from gstruct import gstruct, TiledMemref, GroqBuffer, dtypes
+from gstruct import gstruct, TiledMemref, GroqBuffer, dtypes, GroqMLIR
 from gstruct.constants import VECTOR_SIZE, conv_np_dtype_to_dtypes
 from gstruct.ops import baddbmm as ttl_baddbmm
+from gstruct.models import attention as ttl_attention
 from gstruct.runner import GroqRunner
 from compile_ttl import compile_ttl_model
+
+from gstruct.tiled_memref import move_dimension_to_position
+
+
+USE_EXTERNAL_ATTENTION = False
 
 
 def get_split_num(input_shape: tuple[int, ...], inner_axis: int = -1):
@@ -65,7 +71,8 @@ class GPT2AttentionTTL(GPT2Attention):
 
         assert (
             is_cross_attention == False
-        ), "is_cross_attention==True is not implemented yet"
+        ), "is_cross_attention==True is not implemented yet in TTL"
+
         if is_cross_attention:
             if not hasattr(self, "q_attn"):
                 raise ValueError(
@@ -91,114 +98,67 @@ class GPT2AttentionTTL(GPT2Attention):
             #     self.split_size, dim=2
             # )
 
-            print("hidden_states: ", hidden_states.shape)
-            print("weight:", self.c_attn.weight.shape)
-
-            weight_shape = self.c_attn.weight.shape
-            weight_shape = (1, *weight_shape[:-1], 3, -1)
-            weights = self.c_attn.weight.view(weight_shape)
-            weights = weights.transpose(-2, 1).contiguous()
-
-            bias_shape = self.c_attn.bias.shape
-            bias_shape = (1, *bias_shape[:-1], 1, 3, -1)
-            bias = self.c_attn.bias.view(bias_shape)
-            bias = bias.transpose(-2, 1).contiguous()
-
-            weight_transposed = (
-                weights.numpy().swapaxes(-1, -2).copy().astype(np.float16)
-            )
-            weight_mt = GroqBuffer.constant(value=weight_transposed)
-
-            bias = bias.numpy()
-            bias_mt = GroqBuffer.constant(value=bias)
-
-            print("weight_buffer: ", weight_mt.out_tmemrefs[0])
-            print("bias_buffer: ", bias_mt.out_tmemrefs[0])
-
-            print("weight:", weights.shape)
-
             hidden_states_np = hidden_states.numpy()
-            hidden_states_np = np.expand_dims(hidden_states_np, -3)
 
-            split_num = get_split_num(hidden_states_np.shape)
-            tinput = TiledMemref(
-                hidden_states_np.shape,
-                conv_np_dtype_to_dtypes(hidden_states_np.dtype),
-                ends=(split_num * VECTOR_SIZE - hidden_states_np.shape[-1],),
-            )
+            if USE_EXTERNAL_ATTENTION:
 
-            input_tensor_name = "image"
-            hidden_states_buffer = GroqBuffer.input(input_tensor_name, tinput)
+                weights_np = self.c_attn.weight.numpy()
+                bias_np = self.c_attn.bias.numpy()
 
-            print("bias_mt: ", bias_mt.out_tmemrefs[0])
-            print("hidden_states_buffer: ", hidden_states_buffer.out_tmemrefs[0])
-            print("weight_mt: ", weight_mt.out_tmemrefs[0])
+                split_num = get_split_num(hidden_states_np.shape)
+                tinput = TiledMemref(
+                    hidden_states_np.shape,
+                    conv_np_dtype_to_dtypes(hidden_states_np.dtype),
+                    ends=(split_num * VECTOR_SIZE - hidden_states_np.shape[-1],),
+                )
 
-            x = ttl_baddbmm(
-                bias_mt,
-                hidden_states_buffer,
-                weight_mt,
-            )
+                input_tensor_name = "image"
+                hidden_states_buffer = GroqBuffer.input(input_tensor_name, tinput)
 
-            print("x: ", x.out_tmemrefs[0])
-            vectors_x = x.out_vector_shape
-            print("vectors_x: ", vectors_x)
+                query_states, key_states, value_states = ttl_attention(
+                    hidden_states_buffer, self.head_dim, weights_np, bias_np
+                )
 
-            assert (
-                vectors_x[1] % 3 == 0
-            ), "vectors_x[1] must be divisible by 3 (query, key, value)"
-            static_sizes = [cast(int, dim) for dim in vectors_x]
-            static_sizes[1] = static_sizes[1] // 3
-            print("vectors: ", static_sizes)
+                output_tensors = (query_states, key_states, value_states)
+                output_tensor_names = ("query_states", "key_states", "value_states")
+                basename = "attention"
+                output_dir = "./attentionTTL"
 
-            offset = [0] * len(vectors_x)
-            strides = [1] * len(vectors_x)
-            query_states = gstruct.subview(
-                x,
-                static_offsets=offset,
-                static_sizes=static_sizes,
-                static_strides=strides,
-            )
+                compiled_program = compile_ttl_model(
+                    output_tensors, output_tensor_names, basename, output_dir
+                )
 
-            query_states = gstruct.reshape(
-                query_states,
-                query_states.out_tmemrefs[0].squeeze(1),
-            )
+                Groq_input = {input_tensor_name: hidden_states_np}
 
-            offset[1] += static_sizes[1]
-            key_states = gstruct.subview(
-                x,
-                static_offsets=offset,
-                static_sizes=static_sizes,
-                static_strides=strides,
-            )
+            else:  # Use internal attention
 
-            key_states = gstruct.reshape(
-                key_states,
-                key_states.out_tmemrefs[0].squeeze(1),
-            )
+                basename = "attentionOrig"
+                output_dir = "./attentionTTLOrig"
 
-            offset[1] += static_sizes[1]
-            value_states = gstruct.subview(
-                x,
-                static_offsets=offset,
-                static_sizes=static_sizes,
-                static_strides=strides,
-            )
+                query_states, key_states, value_states = self.attention_ttl(
+                    hidden_states
+                )
 
-            value_states = gstruct.reshape(
-                value_states,
-                value_states.out_tmemrefs[0].squeeze(1),
-            )
+                output_tensors = (query_states, key_states, value_states)
+                output_tensor_names = ("query_states", "key_states", "value_states")
 
-            output_tensors = (query_states, key_states, value_states)
-            output_tensor_names = ("query_states", "key_states", "value_states")
-            basename = "attention"
-            output_dir = "./attentionTTL"
+                compiled_program = compile_ttl_model(
+                    output_tensors, output_tensor_names, basename, output_dir
+                )
 
-            compiled_program = compile_ttl_model(
-                output_tensors, output_tensor_names, basename, output_dir
-            )
+                transposed_weights = (
+                    self.c_attn.weight.numpy()
+                    .swapaxes(-1, -2)
+                    .copy()
+                    .astype(np.float16)
+                )
+
+                input_tensor_name = "image"
+                Groq_input = {
+                    input_tensor_name: hidden_states_np,
+                    "weight": transposed_weights,
+                    "bias": self.c_attn.bias.numpy(),
+                }
 
             with GroqRunner(timing_report=False) as runner:
                 runner.upload_iop_file(
@@ -206,62 +166,24 @@ class GPT2AttentionTTL(GPT2Attention):
                     program_name=compiled_program["program_name"],
                 )
 
-                results_groq = runner.invoke(
-                    {
-                        input_tensor_name: hidden_states_np,
-                    }
-                )
+                results_groq = runner.invoke(Groq_input)
 
             query_states = torch.from_numpy(results_groq["query_states"])
             key_states = torch.from_numpy(results_groq["key_states"])
             value_states = torch.from_numpy(results_groq["value_states"])
 
-            print(f"query_states.shape: {query_states.shape}")
-            print(f"key_states.shape: {key_states.shape}")
-            print(f"value_states.shape: {value_states.shape}")
-
-            # ------------------------------------------------------------
-            # basename = "attentionOrig"
-            # output_dir = "./attentionTTLOrig"
-
-            # concanated_tensor = self.c_attn.forward_ttl(hidden_states_buffer)
-            # shape = concanated_tensor.out_tensor_shape
-            # shape = [cast(int, dim) for dim in shape]
-
-            # assert (
-            #     shape[-1] % 3 == 0
-            # ), "concanated_tensor.shape[-1] must be divisible by 3 (query, key, value)"
-
-            # target_shape = tuple([*shape[:-1], 3, shape[-1] // 3])
-            # ends = (
-            #     target_shape[-1] + VECTOR_SIZE - 1
-            # ) // VECTOR_SIZE * VECTOR_SIZE - target_shape[-1]
-
-            # unpacked_tensor = gstruct.vector_unpack(
-            #     concanated_tensor,
-            #     TiledMemref(
-            #         target_shape,
-            #         x.out_dtype,
-            #         ends=(ends,),
-            #     ),
-            # )
-
-            # output_tensors = (unpacked_tensor,)
-            # compiled_program = compile_ttl_model(
-            #     output_tensors, output_tensor_names, basename, output_dir
-            # )
-            # ------------------------------------------------------------
-
-            print("query_states: ", query_states.shape)
+            # shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
+            shape_kv = key_states.shape
+            print("shape_kv: ", shape_kv)
+            # key_states = key_states.view(shape_kv).transpose(1, 2)
+            # value_states = value_states.view(shape_kv).transpose(1, 2)
             print("key_states: ", key_states.shape)
             print("value_states: ", value_states.shape)
 
-            shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
-            key_states = key_states.view(shape_kv).transpose(1, 2)
-            value_states = value_states.view(shape_kv).transpose(1, 2)
-
-        shape_q = (*query_states.shape[:-1], -1, self.head_dim)
-        query_states = query_states.view(shape_q).transpose(1, 2)
+        # shape_q = (*query_states.shape[:-1], -1, self.head_dim)
+        shape_q = query_states.shape
+        # query_states = query_states.view(shape_q).transpose(1, 2)
+        print("query_states: ", query_states.shape)
 
         if (past_key_values is not None and not is_cross_attention) or (
             past_key_values is not None and is_cross_attention and not is_updated
@@ -316,6 +238,87 @@ class GPT2AttentionTTL(GPT2Attention):
             output_attentions,
             **kwargs,
         )
+
+    def attention_ttl(
+        self, hidden_states_buffer: GroqBuffer
+    ) -> Tuple[GroqMLIR, GroqMLIR, GroqMLIR]:
+
+        concanated_tensor = self.c_attn.forward_ttl(hidden_states_buffer)
+
+        shape = concanated_tensor.out_tensor_shape
+        shape = [cast(int, dim) for dim in shape]
+
+        assert (
+            shape[-1] % 3 == 0
+        ), "concanated_tensor.shape[-1] must be divisible by 3 (query, key, value)"
+
+        target_shape = tuple(
+            [*shape[:-1], 3, shape[-1] // (3 * self.head_dim), self.head_dim]
+        )
+        ends = (
+            target_shape[-1] + VECTOR_SIZE - 1
+        ) // VECTOR_SIZE * VECTOR_SIZE - target_shape[-1]
+
+        unpacked_tensor = gstruct.vector_unpack(
+            concanated_tensor,
+            TiledMemref(
+                target_shape,
+                concanated_tensor.out_dtype,
+                ends=(ends,),
+            ),
+        )
+
+        unpacked_tensor = gstruct.transpose(unpacked_tensor, (0, 3, 2, 1, 4))
+
+        vectors_x = cast(Tuple[int, ...], unpacked_tensor.out_vector_shape)
+
+        assert (
+            vectors_x[2] % 3 == 0
+        ), "vectors_x[2] must be divisible by 3 (query, key, value)"
+        static_sizes = [cast(int, dim) for dim in vectors_x]
+        static_sizes[2] = static_sizes[2] // 3
+
+        offset = [0] * len(vectors_x)
+        strides = [1] * len(vectors_x)
+        query_states = gstruct.subview(
+            unpacked_tensor,
+            static_offsets=offset,
+            static_sizes=static_sizes,
+            static_strides=strides,
+        )
+
+        query_states = gstruct.reshape(
+            query_states,
+            query_states.out_tmemrefs[0].squeeze(2),
+        )
+
+        offset[2] += static_sizes[2]
+        key_states = gstruct.subview(
+            unpacked_tensor,
+            static_offsets=offset,
+            static_sizes=static_sizes,
+            static_strides=strides,
+        )
+
+        key_states = gstruct.reshape(
+            key_states,
+            key_states.out_tmemrefs[0].squeeze(2),
+        )
+
+        offset[2] += static_sizes[2]
+        value_states = gstruct.subview(
+            unpacked_tensor,
+            static_offsets=offset,
+            static_sizes=static_sizes,
+            static_strides=strides,
+        )
+
+        value_states = gstruct.reshape(
+            value_states,
+            value_states.out_tmemrefs[0].squeeze(2),
+        )
+
+        return query_states, key_states, value_states
 
 
 class GPT2BlockTTL(GPT2Block):
