@@ -89,23 +89,10 @@ class Conv1DTTL(Conv1D):
         weight_transposed = (
             self.weight.numpy().swapaxes(-1, -2).copy().astype(np.float16)
         )
-        split_num = get_split_num(weight_transposed.shape)
-
-        tweight = TiledMemref(
-            weight_transposed.shape,
-            conv_np_dtype_to_dtypes(weight_transposed.dtype),
-            ends=(split_num * VECTOR_SIZE - weight_transposed.shape[-1],),
-        )
-        weight_buffer = GroqBuffer.input("weight", tweight)
+        weight_buffer = GroqBuffer.constant(value=weight_transposed)
 
         bias = self.bias.numpy()
-        split_num = get_split_num(bias.shape)
-        tbias = TiledMemref(
-            bias.shape,
-            conv_np_dtype_to_dtypes(bias.dtype),
-            ends=(split_num * VECTOR_SIZE - bias.shape[-1],),
-        )
-        bias_buffer = GroqBuffer.input("bias", tbias)
+        bias_buffer = GroqBuffer.constant(value=bias)
 
         x = ttl_addmm(
             bias_buffer,

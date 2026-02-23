@@ -21,6 +21,7 @@ from groq_convolution.gapi_pooling import GroqMaxPooling1D
 from groq_convolution.constants import VECTOR_SIZE
 
 from gstruct import GroqMLIR
+from gstruct.ops import gstruct_output_tensor
 
 import torch
 
@@ -39,12 +40,24 @@ def compile_ttl_model(
         if isinstance(model, tuple):
 
             output_buffer = [
-                GroqBuffer.output(output_tensor_name[idx], model[idx])
+                gstruct_output_tensor(
+                    output_tensor_name[idx],
+                    model[idx],
+                    byte_packed=True,
+                    output_packed=True,
+                )
                 for idx in range(len(model))
             ]
 
         elif isinstance(model, GroqMLIR):
-            output_buffer = [GroqBuffer.output(output_tensor_name, model)]
+            output_buffer = [
+                gstruct_output_tensor(
+                    output_tensor_name,
+                    model,
+                    byte_packed=True,
+                    output_packed=True,
+                )
+            ]
         else:
             raise ValueError(f"Invalid model type: {type(model)}")
 
