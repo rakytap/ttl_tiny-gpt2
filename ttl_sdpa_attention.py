@@ -23,10 +23,11 @@ from gstruct import gstruct
 import numpy as np
 from typing import Union, cast
 
-from gstruct.constants import VECTOR_SIZE, conv_np_dtype_to_dtypes
+from gstruct.constants import VECTOR_SIZE, conv_np_dtype_to_dtypes, dtypes_to_np
 
 from ttl_pytorch_utils import get_split_num
 from gstruct.tiled_memref import move_dimension_to_position
+from gstruct import vxm_ops
 
 
 TORCH_TO_NUMPY = {
@@ -195,12 +196,21 @@ def sdpa_attention_forward_ttl(
 
     attn_output = ttl_activation(attn_output, activation_function="Softmax", dim=-1)
 
+    print("attn_output: ", attn_output.out_tmemrefs[0])
+
     assert dropout == 0.0, "dropout is not supported in TTL"
 
-    value_buffer_shape = value_buffer.out_tensor_shape
-    value_buffer_shape = [cast(int, dim) for dim in value_buffer_shape]
-
     value_buffer_transposed = ttl_transpose_inner_dim(value_buffer, dim=2)
+
+    input_shape = value_buffer_transposed.out_tensor_shape
+    input_shape = [cast(int, dim) for dim in input_shape]
+
+    tmp_np = np.zeros((VECTOR_SIZE,), dtype=np.uint8)
+    tmp_np[0 : input_shape[-1]] = 1
+    tmp_buffer = GroqBuffer.constant(value=tmp_np)
+    value_buffer_transposed = gstruct.vxm(
+        vxm_ops.vxm_binary_mask, tmp_buffer, value_buffer_transposed
+    )
 
     attn_output = ttl_bmm(attn_output, value_buffer_transposed)
 

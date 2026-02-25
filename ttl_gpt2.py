@@ -893,18 +893,18 @@ class GPT2LMHeadModelTTL(GPT2LMHeadModel):
         if bias_np is not None:
             bias_np = bias_np.numpy()
 
-        # logits = linear_ttl(
-        #     hidden_states_subview,
-        #     weights=weight_np,
-        #     bias=bias_np,
-        # )
-        # logits = self.lm_head(hidden_states_subview)
+        logits = linear_ttl(
+            hidden_states_subview,
+            weights=weight_np,
+            bias=bias_np,
+        )
+        ##logits = self.lm_head(hidden_states_subview)
 
         basename = "GPT2LMHeadModelTTL"
         output_dir = "./GPT2LMHeadModelTTL"
 
-        output_tensors = (hidden_states, hidden_states_subview)
-        output_tensor_names = ("hidden_states", "hidden_states_subview")
+        output_tensors = (hidden_states, logits)
+        output_tensor_names = ("hidden_states", "logits")
 
         compiled_program = compile_ttl_model(
             output_tensors, output_tensor_names, basename, output_dir
@@ -924,8 +924,8 @@ class GPT2LMHeadModelTTL(GPT2LMHeadModel):
             results_groq = runner.invoke(Groq_input)
 
         hidden_states = torch.from_numpy(results_groq["hidden_states"])
-        hidden_states_subview = torch.from_numpy(results_groq["hidden_states_subview"])
-        # logits = torch.from_numpy(results_groq["logits"])
+        # hidden_states_subview = torch.from_numpy(results_groq["hidden_states_subview"])
+        logits = torch.from_numpy(results_groq["logits"])
 
         # slice_indices = (
         #     slice(-logits_to_keep, None)
@@ -934,7 +934,7 @@ class GPT2LMHeadModelTTL(GPT2LMHeadModel):
         # )
 
         # hidden_states_subview = hidden_states[:, slice_indices, :]
-        logits = self.lm_head(hidden_states_subview)
+        # logits = self.lm_head(hidden_states_subview)
 
         loss = None
         if labels is not None:
