@@ -10,7 +10,7 @@ import math
 
 import torch
 
-from gstruct.ops import tril as ttl_tril
+from gstruct.ops import clean_inner_dim as ttl_clean_inner_dim
 from gstruct.ops import triu as ttl_triu
 from gstruct.ops import baddbmm as ttl_baddbmm
 from gstruct.ops import bmm as ttl_bmm
@@ -201,16 +201,7 @@ def sdpa_attention_forward_ttl(
     assert dropout == 0.0, "dropout is not supported in TTL"
 
     value_buffer_transposed = ttl_transpose_inner_dim(value_buffer, dim=2)
-
-    input_shape = value_buffer_transposed.out_tensor_shape
-    input_shape = [cast(int, dim) for dim in input_shape]
-
-    tmp_np = np.zeros((VECTOR_SIZE,), dtype=np.uint8)
-    tmp_np[0 : input_shape[-1]] = 1
-    tmp_buffer = GroqBuffer.constant(value=tmp_np)
-    value_buffer_transposed = gstruct.vxm(
-        vxm_ops.vxm_binary_mask, tmp_buffer, value_buffer_transposed
-    )
+    value_buffer_transposed = ttl_clean_inner_dim(value_buffer_transposed)
 
     attn_output = ttl_bmm(attn_output, value_buffer_transposed)
 
